@@ -19,7 +19,7 @@ This is the official implementation of the paper: [TADFormer : Task-Adaptive Dyn
 
 **Run the code**
 ```
-CUDA_VISIBLE_DEVICES=6 python -m torch.distributed.launch --nproc_per_node 1 --master_port 29561 main.py --cfg configs/TADFormer/TADFormer_r64_Swin-T_nyuv2.yaml --nyud NYUv2_MT   --tasks semseg,normals,depth --batch-size 12 --ckpt-freq=20 --eval-freq=5 --epochs=300 --resume-backbone backbone/Swin/swin_tiny_patch4_window7_224.pth --disable-delta-mtl
+CUDA_VISIBLE_DEVICES=6 python -m torch.distributed.launch --nproc_per_node 1 --master_port 29561 main.py --cfg configs/TADFormer/TADFormer_r64_Swin-T_nyuv2.yaml --nyud NYUv2_MT   --tasks semseg,normals,depth --batch-size 12 --ckpt-freq=20 --eval-freq=5 --epochs=300 --resume-backbone backbone/Swin/swin_tiny_patch4_window7_224.pth
 ```
 
 **Eval**
