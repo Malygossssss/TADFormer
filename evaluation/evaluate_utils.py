@@ -53,39 +53,6 @@ class PerformanceMeter(object):
 
         return eval_dict
 
-
-def calculate_multi_task_performance(eval_dict, single_task_dict):
-    assert(set(eval_dict.keys()) == set(single_task_dict.keys()))
-    tasks = eval_dict.keys()
-    num_tasks = len(tasks)
-    mtl_performance = 0.0
-
-    for task in tasks:
-        mtl = eval_dict[task]
-        stl = single_task_dict[task]
-
-        if task == 'depth':  # rmse lower is better
-            mtl_performance -= (mtl['rmse'] - stl['rmse'])/stl['rmse']
-
-        elif task in ['semseg', 'sal', 'human_parts']:  # mIoU higher is better
-            mtl_performance += (mtl['mIoU'] - stl['mIoU'])/stl['mIoU']
-
-        elif task == 'normals':  # mean error lower is better
-            mtl_performance -= (mtl['mean'] - stl['mean'])/stl['mean']
-
-        elif task == 'edge':
-            if 'odsF' in mtl and 'odsF' in stl:  # preferred formal metric
-                mtl_performance += (mtl['odsF'] - stl['odsF'])/stl['odsF']
-            elif 'loss' in mtl and 'loss' in stl:  # fallback for legacy runs
-                mtl_performance -= (mtl['loss'] - stl['loss'])/stl['loss']
-            else:
-                raise KeyError('edge metrics must contain odsF or loss')
-
-        else:
-            raise NotImplementedError
-
-    return mtl_performance / num_tasks
-
 # TODO change database to handle more datasets
 
 

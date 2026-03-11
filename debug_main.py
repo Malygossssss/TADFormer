@@ -32,10 +32,10 @@ from data import build_loader
 from lr_scheduler import build_scheduler
 from optimizer import build_optimizer
 from logger import create_logger
-from utils import load_checkpoint, load_pretrained, save_checkpoint, save_best_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper
+from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper
 
 from mtl_loss_schemes import MultiTaskLoss, get_loss
-from evaluation.evaluate_utils import PerformanceMeter, get_output, calculate_multi_task_performance
+from evaluation.evaluate_utils import PerformanceMeter, get_output
 from ptflops import get_model_complexity_info
 from models.lora import mark_only_lora_as_trainable
 
@@ -309,7 +309,6 @@ Encoder trainable params:   {encoder_trainable_params:,}
     start_time = time.perf_counter()
 
     epoch = 0
-    best_delta_mtl = 0
 
     for epoch in range(config.TRAIN.EPOCHS):
         if not config.MTL:
@@ -322,17 +321,10 @@ Encoder trainable params:   {encoder_trainable_params:,}
                             logger)
         if epoch % config.EVAL_FREQ == 0 or (not args.no_eval_50 and epoch == 50):
             if config.MTL:
-                _, delta_mtl = validate(config, data_loader_val, model, epoch)
+                validate(config, data_loader_val, model, epoch)
             else:
                 acc1, _, _ = validate(config, data_loader_val, model, epoch)
                 max_accuracy = max(max_accuracy, acc1)
-
-            if delta_mtl > best_delta_mtl:
-                best_delta_mtl = delta_mtl
-                best_model_epoch = epoch
-                print(f"Save Best models: epoch [{epoch}]")
-                save_best_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler,
-                                logger)
 
 
     # final eval
@@ -601,9 +593,6 @@ def validate(config, data_loader, model, epoch, infer=False):
 
     eval_results = performance_meter.get_score(verbose=True)
 
-    # Calculate delta_mtl
-    delta_mtl = calculate_multi_task_performance(eval_dict=eval_results, single_task_dict=config.DATA.SINGLE_TASK_DICT)
-
     epoch_time = time.perf_counter() - start
     logger.info(
         f"eval takes {datetime.timedelta(seconds=int(epoch_time))}")
@@ -629,12 +618,10 @@ def validate(config, data_loader, model, epoch, infer=False):
         if 'depth' in eval_results:
             scores_logs["val/tasks/depth/rmse"] = eval_results['depth']['rmse']
             scores_logs["val/tasks/depth/log_rmse"] = eval_results['depth']['log_rmse']
-        # log for delta_mtl
-        scores_logs["val/delta_mtl"] = delta_mtl
 
         wandb.log(scores_logs)
 
-    return eval_results, delta_mtl
+    return eval_results
 
 
 
@@ -985,6 +972,7 @@ if __name__ == '__main__':
     # logger = create_logger(output_dir=config.OUTPUT,
     #                        dist_rank=dist.get_rank(), name=f"{config.MODEL.NAME}")
     logger = create_logger(output_dir=config.OUTPUT, name=f"{config.MODEL.NAME}")
+    eval_logger = create_logger(output_dir=config.OUTPUT, name="eval")
 
     # if dist.get_rank() == 0:
     #     path = os.path.join(config.OUTPUT, "config.json")
