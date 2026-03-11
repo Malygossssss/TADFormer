@@ -299,6 +299,7 @@ _C.LOCAL_RANK = 0
 _C.FUSED_WINDOW_PROCESS = False
 _C.FUSED_LAYERNORM = False
 _C.SKIP_INITIAL_EVAL = False
+_C.CALCULATE_DELTA_MTL = True
 _C.MODEL.DECODER_DOWNSAMPLER = True
 _C.MODEL.PER_TASK_DOWNSAMPLER = True
 _C.MODEL.UPDATE_RELATIVE_POSITION = False
@@ -381,6 +382,8 @@ def update_config(config, args):
 
     if _check_args('skip_initial_validation'):
         config.SKIP_INITIAL_EVAL = True
+    if _check_args('disable_delta_mtl'):
+        config.CALCULATE_DELTA_MTL = False
 
     if _check_args('eval_training_freq'):
         config.EVAL_TRAINING = args.eval_training_freq

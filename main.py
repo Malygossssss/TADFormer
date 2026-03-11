@@ -134,6 +134,8 @@ def parse_option():
                         help='Skip loading decoder head weights')
     parser.add_argument('--disable_wandb', action='store_true',
                         help='Disable wandb logging.')
+    parser.add_argument('--disable-delta-mtl', action='store_true',
+                        help='Skip delta_mtl computation during validation.')
     parser.add_argument('--run_name', type=str,
                         help='wandb run name')
     parser.add_argument('--no_eval_50', action='store_false',
@@ -321,7 +323,7 @@ Encoder trainable params:   {encoder_trainable_params:,}
                 acc1, _, _ = validate(config, data_loader_val, model, epoch)
                 max_accuracy = max(max_accuracy, acc1)
 
-            if delta_mtl > best_delta_mtl:
+            if config.MTL and delta_mtl is not None and delta_mtl > best_delta_mtl:
                 best_delta_mtl = delta_mtl
                 best_model_epoch = epoch
                 print(f"Save Best models: epoch [{epoch}]")
@@ -609,8 +611,14 @@ def validate(config, data_loader, model, epoch, infer=False):
         if edge_eval_dir is not None and os.path.isdir(edge_eval_dir):
             shutil.rmtree(edge_eval_dir, ignore_errors=True)
 
-    # Calculate delta_mtl
-    delta_mtl = calculate_multi_task_performance(eval_dict=eval_results, single_task_dict=config.DATA.SINGLE_TASK_DICT)
+    delta_mtl = None
+    if config.CALCULATE_DELTA_MTL:
+        delta_mtl = calculate_multi_task_performance(
+            eval_dict=eval_results,
+            single_task_dict=config.DATA.SINGLE_TASK_DICT,
+        )
+    else:
+        logger.info("Skipping delta_mtl calculation for this validation run.")
 
     epoch_time = time.perf_counter() - start
     logger.info(
@@ -641,8 +649,8 @@ def validate(config, data_loader, model, epoch, infer=False):
         if 'depth' in eval_results:
             scores_logs["val/tasks/depth/rmse"] = eval_results['depth']['rmse']
             scores_logs["val/tasks/depth/log_rmse"] = eval_results['depth']['log_rmse']
-        # log for delta_mtl
-        scores_logs["val/delta_mtl"] = delta_mtl
+        if delta_mtl is not None:
+            scores_logs["val/delta_mtl"] = delta_mtl
 
         wandb.log(scores_logs)
 
