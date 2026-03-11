@@ -50,6 +50,21 @@ except ImportError:
     wandb_available = False
 
 
+def _log_metric_summary(logger, stage_name, scores):
+    """Log scalar task metrics through the main experiment logger."""
+    logger.info(f"{stage_name} metrics summary:")
+    for task, task_scores in scores.items():
+        scalar_items = []
+        for metric_name, metric_value in task_scores.items():
+            if np.isscalar(metric_value):
+                scalar_items.append(f"{metric_name}={float(metric_value):.4f}")
+
+        if scalar_items:
+            logger.info(f"{stage_name}/{task}: " + ", ".join(scalar_items))
+        else:
+            logger.info(f"{stage_name}/{task}: no scalar metrics")
+
+
 def parse_option():
     parser = argparse.ArgumentParser(
         'Swin Transformer training and evaluation script', add_help=False)
@@ -463,7 +478,8 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         performance_meter.update(
             {t: get_output(outputs[t], t) for t in config.TASKS}, targets)
 
-        scores = performance_meter.get_score(verbose=True)
+        scores = performance_meter.get_score(verbose=False)
+        _log_metric_summary(logger, "train", scores)
         if wandb_available:
             scores_logs = {
                 "train/epoch": epoch,
@@ -606,10 +622,12 @@ def validate(config, data_loader, model, epoch, infer=False):
             )
             performance_meter.meters["edge"].set_formal_results(formal_edge_results)
 
-        eval_results = performance_meter.get_score(verbose=True)
+        eval_results = performance_meter.get_score(verbose=False)
     finally:
         if edge_eval_dir is not None and os.path.isdir(edge_eval_dir):
             shutil.rmtree(edge_eval_dir, ignore_errors=True)
+
+    _log_metric_summary(logger, "val", eval_results)
 
     delta_mtl = None
     if config.CALCULATE_DELTA_MTL:
