@@ -1,9 +1,9 @@
-# This code is referenced from 
+# This code is referenced from
 # https://github.com/facebookresearch/astmt/
-# 
+#
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
-# 
+#
 # License: Attribution-NonCommercial 4.0 International
 
 import warnings
@@ -14,6 +14,9 @@ import os.path
 import numpy as np
 import torch
 from PIL import Image
+import logging
+
+eval_logger = logging.getLogger('eval')
 
 PART_CATEGORY_NAMES = ['background', 'head', 'torso', 'uarm', 'larm', 'uleg', 'lleg']
 
@@ -28,7 +31,7 @@ def eval_human_parts(loader, folder, n_parts=6):
     for i, sample in enumerate(loader):
 
         if i % 500 == 0:
-            print('Evaluating: {} of {} objects'.format(i, len(loader)))
+            eval_logger.info('Evaluating: {} of {} objects'.format(i, len(loader)))
 
         if 'human_parts' not in sample:
             continue
@@ -62,7 +65,7 @@ def eval_human_parts(loader, folder, n_parts=6):
             fp[i_part] += np.sum(~tmp_gt & tmp_pred & (valid))
             fn[i_part] += np.sum(tmp_gt & ~tmp_pred & (valid))
 
-    print('Successful evaluation for {} images'.format(counter))
+    eval_logger.info('Successful evaluation for {} images'.format(counter))
     jac = [0] * (n_parts + 1)
     for i_part in range(0, n_parts + 1):
         jac[i_part] = float(tp[i_part]) / max(float(tp[i_part] + fp[i_part] + fn[i_part]), 1e-8)
@@ -85,11 +88,11 @@ class HumanPartsMeter(object):
         self.fp = [0] * (self.n_parts + 1)
         self.fn = [0] * (self.n_parts + 1)
 
-    @torch.no_grad() 
+    @torch.no_grad()
     def update(self, pred, gt):
         pred, gt = pred.squeeze(), gt.squeeze()
         valid = (gt != 255)
-        
+
         for i_part in range(self.n_parts + 1):
             tmp_gt = (gt == i_part)
             tmp_pred = (pred == i_part)
@@ -101,7 +104,7 @@ class HumanPartsMeter(object):
         self.tp = [0] * (self.n_parts + 1)
         self.fp = [0] * (self.n_parts + 1)
         self.fn = [0] * (self.n_parts + 1)
- 
+
     def get_score(self, verbose=True):
         jac = [0] * (self.n_parts + 1)
         for i_part in range(0, self.n_parts + 1):
@@ -110,28 +113,30 @@ class HumanPartsMeter(object):
         eval_result = dict()
         eval_result['jaccards_all_categs'] = jac
         eval_result['mIoU'] = np.mean(jac)
-        
-        print('\nHuman Parts mIoU: {0:.4f}\n'.format(100 * eval_result['mIoU']))
+
+        eval_logger.info('\nHuman Parts mIoU: {0:.4f}\n'.format(100 * eval_result['mIoU']))
         class_IoU = jac
         for i in range(len(class_IoU)):
             spaces = ''
             for j in range(0, 15 - len(self.cat_names[i])):
                 spaces += ' '
-            print('{0:s}{1:s}{2:.4f}'.format(self.cat_names[i], spaces, 100 * class_IoU[i]))
+            eval_logger.info('{0:s}{1:s}{2:.4f}'.format(self.cat_names[i], spaces, 100 * class_IoU[i]))
 
         return eval_result
 
 
-def eval_human_parts_predictions(database, save_dir, overfit=False):
+def eval_human_parts_predictions(database, save_dir, gt_root=None, overfit=False):
     """ Evaluate the human parts predictions that are stored in the save dir """
 
     # Dataloaders
     if database == 'PASCALContext':
-        from data.pascal_context import PASCALContext
+        from data.mtl_ds import PASCALContext
+        if gt_root is None:
+            raise ValueError('gt_root must be provided for PASCAL human-parts evaluation')
         gt_set = 'val'
-        db = PASCALContext(split=gt_set, do_edge=False, do_human_parts=True, do_semseg=False,
+        db = PASCALContext(root=gt_root, split=gt_set, do_edge=False, do_human_parts=True, do_semseg=False,
                                           do_normals=False, do_sal=False, overfit=overfit)
-    
+
     else:
         raise NotImplementedError
 
@@ -139,7 +144,7 @@ def eval_human_parts_predictions(database, save_dir, overfit=False):
     fname = os.path.join(save_dir, base_name + '.json')
 
     # Eval the model
-    print('Evaluate the saved images (human parts)')
+    eval_logger.info('Evaluate the saved images (human parts)')
     eval_results = eval_human_parts(db, os.path.join(save_dir, 'human_parts'))
     with open(fname, 'w') as f:
         json.dump(eval_results, f)
@@ -148,11 +153,11 @@ def eval_human_parts_predictions(database, save_dir, overfit=False):
     class_IoU = eval_results['jaccards_all_categs']
     mIoU = eval_results['mIoU']
 
-    print('\nHuman Parts mIoU: {0:.4f}\n'.format(100 * mIoU))
+    eval_logger.info('\nHuman Parts mIoU: {0:.4f}\n'.format(100 * mIoU))
     for i in range(len(class_IoU)):
         spaces = ''
         for j in range(0, 15 - len(PART_CATEGORY_NAMES[i])):
             spaces += ' '
-        print('{0:s}{1:s}{2:.4f}'.format(PART_CATEGORY_NAMES[i], spaces, 100 * class_IoU[i]))
+        eval_logger.info('{0:s}{1:s}{2:.4f}'.format(PART_CATEGORY_NAMES[i], spaces, 100 * class_IoU[i]))
 
     return eval_results
