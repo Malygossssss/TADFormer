@@ -2,13 +2,13 @@ DATA:
   IMG_SIZE: 448
   SINGLE_TASK_DICT:
     semseg:
-      mIoU: 0.6721
+      mIoU: 40.65
     normals:
-      rmse: 17.97
-    sal: 
-      mIoU: 0.6235
-    human_parts:
-      mIoU: 0.6193
+      rmse: 22.97
+    depth: 
+      rmse: 0.6436
+    edge:
+      odsF: 0.2840
 
 TRAIN:
    FREEZE_DOWNSAMPLE_REDUCTION: True
