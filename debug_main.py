@@ -88,7 +88,7 @@ def parse_option():
     parser.add_argument('--amp-opt-level', type=str, choices=['O0', 'O1', 'O2'],
                         help='mixed precision opt level, if O0, no amp is used (deprecated!)')
     parser.add_argument('--output', default='output', type=str, metavar='PATH',
-                        help='root of output folder, the full path is <output>/<model_name>/<tag> (default: output)')
+                        help='root of output folder, the full path is <output>/<model_name>/<tag>/run_<timestamp> (default: output)')
     parser.add_argument('--name', type=str, help='override model name')
     parser.add_argument('--tag', help='tag of experiment')
     parser.add_argument('--eval', action='store_true',
@@ -968,11 +968,16 @@ if __name__ == '__main__':
     config.TRAIN.MIN_LR = linear_scaled_min_lr
     config.freeze()
 
-    os.makedirs(config.OUTPUT, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(config.OUTPUT, f"run_{timestamp}")
+    config.defrost()
+    config.OUTPUT = output_dir
+    config.freeze()
+    os.makedirs(output_dir, exist_ok=True)
     # logger = create_logger(output_dir=config.OUTPUT,
     #                        dist_rank=dist.get_rank(), name=f"{config.MODEL.NAME}")
-    logger = create_logger(output_dir=config.OUTPUT, name=f"{config.MODEL.NAME}")
-    eval_logger = create_logger(output_dir=config.OUTPUT, name="eval")
+    logger = create_logger(output_dir=output_dir, name=f"{config.MODEL.NAME}")
+    eval_logger = create_logger(output_dir=output_dir, name="eval")
 
     # if dist.get_rank() == 0:
     #     path = os.path.join(config.OUTPUT, "config.json")
@@ -980,7 +985,7 @@ if __name__ == '__main__':
     #         f.write(config.dump())
     #     logger.info(f"Full config saved to {path}")
 
-    path = os.path.join(config.OUTPUT, "config.json")
+    path = os.path.join(output_dir, "config.json")
     with open(path, "w") as f:
         f.write(config.dump())
     logger.info(f"Full config saved to {path}")
