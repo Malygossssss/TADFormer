@@ -210,7 +210,7 @@ _C.TRAIN.LR_SCHEDULER.MULTISTEPS = []
 _C.TRAIN.SKIP_DECODER_CKPT = False
 
 # Fine-Tuning Selection
-_C.TRAIN.FREEZE_PATCH_EMBED = False
+_C.TRAIN.FREEZE_PATCH_EMBED = True
 _C.TRAIN.FREEZE_LAYER_NORM = False
 _C.TRAIN.FREEZE_RELATIVE_POSITION_BIAS = False
 _C.TRAIN.FREEZE_DOWNSAMPLE_REDUCTION = False
@@ -307,12 +307,12 @@ _C.MODEL.TADMTL = CN()
 _C.MODEL.TADMTL.ENABLED = False
 _C.MODEL.TADMTL.BIAS = 'none'  # none, all, lora_only
 _C.MODEL.TADMTL.R = [8, 8, 8, 8]
-_C.MODEL.TADMTL.SHARED_R = 64
+_C.MODEL.TADMTL.SHARED_R = 64  # Deprecated legacy alias for R.
 _C.MODEL.TADMTL.SHARED_SCALE = [2.0, 2.0, 2.0, 2.0]
-_C.MODEL.TADMTL.TASK_SCALE = [2.0, 2.0, 2.0, 2.0]
+_C.MODEL.TADMTL.TASK_SCALE = [2.0, 2.0, 2.0, 2.0]  # Legacy scale field for non-matrix modes.
 _C.MODEL.TADMTL.DROPOUT = [0.05, 0.05, 0.05, 0.05]
 _C.MODEL.TADMTL.TRAINABLE_SCALE_SHARED = False
-_C.MODEL.TADMTL.TRAINABLE_SCALE_PER_TASK = False
+_C.MODEL.TADMTL.TRAINABLE_SCALE_PER_TASK = False  # Legacy alias for non-matrix modes.
 _C.MODEL.TADMTL.INTERMEDIATE_SPECIALIZATION = False
 _C.MODEL.TADMTL.FREEZE_PRETRAINED = True
 _C.MODEL.TADMTL.SPLIT_QKV = False
@@ -330,6 +330,8 @@ _C.MODEL.TADMTL.DTF.ENABLED = False
 
 _C.MODEL.TADMTL.TPC = CN(new_allowed=True)
 _C.MODEL.TADMTL.TPC.ENABLED = False
+_C.MODEL.TADMTL.TPC.PROMPT_CFG = CN(new_allowed=True)
+_C.MODEL.TADMTL.TPC.PROMPT_CFG.PERTASK_LEN = 1
 
 _C.MODEL.TADMTL.ABLATION = CN(new_allowed=True)
 
@@ -492,6 +494,13 @@ def update_config(config, args):
 
 
     if config.MODEL.TADMTL.ENABLED:
+        if config.MODEL.TADMTL.SHARED_R is not None:
+            default_r = _C.MODEL.TADMTL.R
+            if config.MODEL.TADMTL.R == default_r and config.MODEL.TADMTL.SHARED_R != default_r[0]:
+                config.MODEL.TADMTL.R = [config.MODEL.TADMTL.SHARED_R] * len(config.MODEL.SWIN.DEPTHS)
+            elif config.MODEL.TADMTL.R != default_r and any(r != config.MODEL.TADMTL.SHARED_R for r in config.MODEL.TADMTL.R):
+                print("[warning] MODEL.TADMTL.SHARED_R is deprecated and ignored because MODEL.TADMTL.R is explicitly set.")
+
         if not isinstance(config.MODEL.TADMTL.R, list):
             config.MODEL.TADMTL.R = [
                 config.MODEL.TADMTL.R] * len(config.MODEL.SWIN.DEPTHS)
@@ -528,6 +537,14 @@ def update_config(config, args):
         else:
             assert len(config.MODEL.TADMTL.DROPOUT) == len(
                 config.MODEL.SWIN.DEPTHS), "TADMTL dropout length should be the same as the number of layers"
+
+        if config.MODEL.TADMTL.SHARED_MODE == 'matrix':
+            if config.MODEL.TADMTL.TRAINABLE_SCALE_PER_TASK and not config.MODEL.TADMTL.TRAINABLE_SCALE_SHARED:
+                print("[warning] MODEL.TADMTL.TRAINABLE_SCALE_PER_TASK is deprecated in SHARED_MODE='matrix'; using TRAINABLE_SCALE_SHARED instead.")
+                config.MODEL.TADMTL.TRAINABLE_SCALE_SHARED = True
+            if config.MODEL.TADMTL.SHARED_SCALE == _C.MODEL.TADMTL.SHARED_SCALE and config.MODEL.TADMTL.TASK_SCALE != _C.MODEL.TADMTL.TASK_SCALE:
+                print("[warning] MODEL.TADMTL.TASK_SCALE is deprecated in SHARED_MODE='matrix'; using it as SHARED_SCALE for backward compatibility.")
+                config.MODEL.TADMTL.SHARED_SCALE = config.MODEL.TADMTL.TASK_SCALE[:]
 
         if len(config.MODEL.TADMTL.SCALE_PER_TASK) == 0:
             for task in config.TASKS:

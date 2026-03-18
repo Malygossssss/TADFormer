@@ -61,6 +61,16 @@ def rearrange(*args, **kwargs):
     return o_rearrange(*args, **kwargs).contiguous()
 
 
+def cfg_enabled(cfg, default=True):
+    if cfg is None:
+        return default
+    if isinstance(cfg, bool):
+        return cfg
+    if hasattr(cfg, "ENABLED"):
+        return bool(cfg.ENABLED)
+    return default
+
+
 class LoRALayer(nn.Module):
     def __init__(self, r: int, lora_alpha: int, lora_dropout: float):
         """Store LoRA specific attributes in a class.
@@ -160,6 +170,7 @@ class LoRALinear(LoRALayer):
 
 
 class NaiveConvFilter(nn.Module):
+    """Legacy static depth-wise filter kept for checkpoint/backward compatibility only."""
     def __init__(self, in_channels, kernel_size, padding):
         super().__init__()
         self.in_channels = in_channels
@@ -191,7 +202,9 @@ class DTF(nn.Module):
                                           running_mean=True)
 
     def forward(self, x):
-
+        # Paper-faithful DTF: GAP-conditioned parameter generation + FilterNorm
+        # followed by sample-wise channel-wise dynamic convolution on the
+        # down-projected task-adapted feature.
         b, c, h, w = x.shape
         weight = self.conv(self.pool(x))
         weight = self.chan_FilterNorm(weight)
@@ -342,7 +355,7 @@ class TSModuleLinear(LoRALayer):
         elif layer_name == "fc2":
             filter_use = taskfilter.FC2_ENABLED
 
-        self.taskfilter = taskfilter.ENABLED
+        self.taskfilter = bool(filter_use and cfg_enabled(taskfilter, default=False))
         self.taskfilter_cfg = taskfilter
 
         self.layer_name = layer_name
@@ -354,11 +367,10 @@ class TSModuleLinear(LoRALayer):
         self.lora_filter = None
 
         if r['shared'] > 0:
-            if has_tasks and taskfilter.ENABLED:
+            if has_tasks and self.taskfilter:
 
                 self.lora_filter = DTF(r['shared'], kernel_size=3, stride=1, padding=1, groups=r['shared'],
                                         prompt_cfg=prompt_cfg)
-                #self.lora_filter = nn.ModuleDict({task: NaiveConvFilter(in_channels=r['shared'], kernel_size=3, padding=1) for task in tasks})
 
             if self.shared_mode == 'addition':
                 assert has_tasks
@@ -439,7 +451,6 @@ class TSModuleLinear(LoRALayer):
                             x_ = x_.reshape(B, h, w, c)
                             x_ = x_.permute(0, 3, 1, 2)
                             x_ = self.lora_filter(x_)
-                            #x_ = self.lora_filter[task](x_)
                             x_ = x_.permute(0, 2, 3, 1)
                             x_tasks[task] = x_.reshape(B, N, c)
 
@@ -504,6 +515,7 @@ class TAModuleLinear(LoRALayer):
         taskfilter: dict = None,
         layer_name: str = None,
         prompt_cfg = None,
+        enabled: bool = True,
 
         **kwargs,
     ):
@@ -520,23 +532,27 @@ class TAModuleLinear(LoRALayer):
 
         if isinstance(r, int):
             r = {'shared': r}
+        effective_r = r['shared'] if enabled else 0
         super().__init__(
-            r=r['shared'], lora_alpha=lora_shared_scale, lora_dropout=lora_dropout)
+            r=effective_r, lora_alpha=lora_shared_scale, lora_dropout=lora_dropout)
         self.linear = torch.nn.Linear(
             in_features, out_features, **kwargs)
 
-        self.tasks = tasks
+        self.enabled = enabled
+        self.tasks = tasks if enabled else None
         self.shared_mode = shared_mode
         self.layer_name = layer_name
-        self.shared_r = r['shared']
+        self.shared_r = effective_r
         self.prompt_cfg = prompt_cfg
         self.lora_filter = None
-        self.taskfilter = taskfilter
+        self.taskfilter_cfg = taskfilter
+        self.taskfilter = bool(self.tasks is not None and cfg_enabled(taskfilter, default=False))
+        self.prompt_len = self.prompt_cfg.PERTASK_LEN * len(self.tasks) if self.prompt_cfg is not None and self.tasks is not None else 0
 
-        if r['shared'] > 0:
-            if has_tasks :
-                #self.lora_filter = DTF(r['shared'], kernel_size=3, stride=1, padding=1, groups=r['shared'], prompt_cfg=prompt_cfg)
-                self.lora_filter = nn.ModuleDict({task: NaiveConvFilter(in_channels=r['shared'], kernel_size=3, padding=1) for task in tasks})
+        if self.shared_r > 0:
+            if self.taskfilter:
+                self.lora_filter = DTF(self.shared_r, kernel_size=3, stride=1, padding=1, groups=self.shared_r,
+                                       prompt_cfg=prompt_cfg)
 
 
             if prompt_cfg is not None :
@@ -562,6 +578,43 @@ class TAModuleLinear(LoRALayer):
             else:
                 self.lora_shared_scale = lora_shared_scale
             self.reset_parameters()
+
+    def _split_proj_inputs(self, x_tasks: Dict[str, torch.Tensor], attn_weight: torch.Tensor, channel_dim: int):
+        task_tokens = {}
+        for task in self.tasks:
+            _, patch_tokens = sep_prompt(x_tasks[task], self.prompt_len)
+            task_tokens[task] = patch_tokens
+
+        if self.layer_name != "proj" or self.prompt_len == 0:
+            return task_tokens
+
+        if attn_weight is None:
+            for task in self.tasks:
+                self.task_skip_feature[task] = task_tokens[task]
+            return task_tokens
+
+        nheads = attn_weight.shape[1]
+        head_channel_no = channel_dim // nheads
+
+        for t_idx, task in enumerate(self.tasks):
+            cur_attn_weight = attn_weight[:, :, t_idx * self.prompt_cfg.PERTASK_LEN:(t_idx + 1) * self.prompt_cfg.PERTASK_LEN, :]
+            patch_tokens = rearrange(task_tokens[task], "bs n c -> bs c n")
+            cur_task_fea = []
+
+            for head_idx in range(nheads):
+                cur_head_attn = cur_attn_weight[:, head_idx, :, :].mean(dim=1, keepdim=True)
+                cur_task_fea.append(
+                    cur_head_attn * patch_tokens[:, head_channel_no * head_idx:head_channel_no * (head_idx + 1), :]
+                )
+
+            cur_task_fea = torch.cat(cur_task_fea, dim=1)
+            # Paper-faithful TA input: TPC first converts prompt-patch attention
+            # into task-adapted patch features, which are then fed into the
+            # projection-layer TA module / DTF path.
+            self.task_skip_feature[task] = cur_task_fea.transpose(1, 2).contiguous()
+            task_tokens[task] = self.prompt_layernorm((cur_task_fea + patch_tokens).transpose(1, 2).contiguous())
+
+        return task_tokens
 
     def reset_parameters(self):
         """Reset all the weights, even including pretrained ones."""
@@ -608,33 +661,13 @@ class TAModuleLinear(LoRALayer):
                     x_tasks = {task : x for task in self.tasks}
 
                 if self.layer_name == "proj":
-                    spa_attn = attn_weight
-                    for task in self.tasks:
-                        task_prompts, x_tasks[task] = sep_prompt(x_tasks[task], self.prompt_cfg.PERTASK_LEN*len(self.tasks))
-
-                    for t_idx, task in enumerate(self.tasks):
-                        cur_attn_weight = spa_attn[:, :, t_idx*self.prompt_cfg.PERTASK_LEN:(t_idx+1)*self.prompt_cfg.PERTASK_LEN, :] # (b, nheads, prompt_len, h*w)
-                        bs, nheads = cur_attn_weight.shape[0:2]
-                        cur_task_fea = []
-                        head_channel_no = C // nheads
-                        x_tasks[task] = rearrange(x_tasks[task], "bs n c -> bs c n")
-
-                        for hea in range(nheads):
-                            cur_head_attn = cur_attn_weight[:, hea:hea + 1, :, :]
-                            cur_head_attn = cur_head_attn.squeeze(1)
-                            cur_task_fea.append(cur_head_attn * x_tasks[task][:, head_channel_no * hea:head_channel_no * (hea + 1), :])
-                        cur_task_fea = torch.cat(cur_task_fea, dim=1)
-
-                        self.task_skip_feature[task] = cur_task_fea
-                        x_tasks[task] = cur_task_fea + x_tasks[task]
-
-                        x_tasks[task] = x_tasks[task].transpose(2, 1)
-                        x_tasks[task] = self.prompt_layernorm(x_tasks[task])
+                    self.task_skip_feature = {}
+                    x_tasks = self._split_proj_inputs(x_tasks, attn_weight, C)
 
 
                 if self.taskfilter :
                     B, N, C = x.size()
-                    prompts_len = self.prompt_cfg.PERTASK_LEN*len(self.tasks)
+                    prompts_len = self.prompt_len
                     if self.layer_name == "proj":
                         N = N - prompts_len
                         h, w = hw_shapes
@@ -657,8 +690,7 @@ class TAModuleLinear(LoRALayer):
                             c = x_.size(2)
                             x_ = x_.reshape(B, h, w, c)
                             x_ = x_.permute(0, 3, 1, 2)
-                            #x_ = self.lora_filter(x_)
-                            x_ = self.lora_filter[task](x_)
+                            x_ = self.lora_filter(x_)
                             x_ = x_.permute(0, 2, 3, 1)
                             x_tasks[task] = x_.reshape(B, N, c)
 
@@ -685,7 +717,7 @@ class TAModuleLinear(LoRALayer):
                 else:
                     lora_tasks = {}
 
-                    prompts_len = self.prompt_cfg.PERTASK_LEN*len(self.tasks)
+                    prompts_len = self.prompt_len
                     if self.layer_name == "proj":
                         for t_idx, task in enumerate(self.tasks):
                             x_ = (x if x_tasks is None else x_tasks[task]) @ self.lora_shared_A.transpose(0, 1)
@@ -973,7 +1005,7 @@ class LoRAQKVLinear(LoRALinear):
         return pretrained + lora
 
 
-def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none", freeze_patch_embed: bool = False, freeze_norm: bool = False, free_relative_bias: bool = False, freeze_downsample_reduction=False) -> None:
+def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none", freeze_patch_embed: bool = True, freeze_norm: bool = False, free_relative_bias: bool = False, freeze_downsample_reduction=False) -> None:
     """Freeze all modules except LoRA's and depending on 'bias' value unfreezes bias weights.
 
     Args:
@@ -988,7 +1020,14 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none", freeze_pat
     """
     def lora_filter(key): return "lora_" in key
 
-    def prompt_filter(key): return "prompt" in key
+    prompt_patterns = (
+        "task_prompts",
+        "task_prompts_up",
+        "prompt_gate",
+        "prompt_layernorm",
+    )
+
+    def prompt_filter(key): return any(pattern in key for pattern in prompt_patterns)
 
     def patch_embed_filter(
         key): return not freeze_patch_embed and "patch_embed" in key
@@ -1001,8 +1040,18 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none", freeze_pat
     def relative_position_bias_filter(
         key): return not free_relative_bias and "relative_position_bias_table" in key
 
+    def absolute_position_filter(key): return "absolute_pos_embed" in key
+
     def all_filters(key):
-        return lora_filter(key) or prompt_filter(key) or patch_embed_filter(key) or norm_filter(key) or downsample_reduction_filter(key) or relative_position_bias_filter(key)
+        return (
+            lora_filter(key)
+            or prompt_filter(key)
+            or patch_embed_filter(key)
+            or norm_filter(key)
+            or downsample_reduction_filter(key)
+            or relative_position_bias_filter(key)
+            or absolute_position_filter(key)
+        )
 
     print(f"LoRA bias mode: {bias}")
     print(f"LoRA Freeze patch_embed: {freeze_patch_embed}")
