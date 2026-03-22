@@ -12,7 +12,7 @@ DATA:
 
 TRAIN:
    FREEZE_DOWNSAMPLE_REDUCTION: True
-#  FREEZE_PATCH_EMBED: True
+   FREEZE_PATCH_EMBED: True
 #  FREEZE_LAYER_NORM: True
 #  FREEZE_RELATIVE_POSITION_BIAS: False
 
@@ -42,7 +42,7 @@ MODEL:
     FC1_ENABLED: True
     FC2_ENABLED: True
     DOWNSAMPLER_ENABLED: False
-    SHARED_R: 64
+    SHARED_R: 64  # Deprecated alias; runtime uses R.
 
     # Dynamic Task Filter
     DTF:

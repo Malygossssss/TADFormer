@@ -9,7 +9,6 @@
 # Repository: https://github.com/scale-lab/MTLoRA
 
 import torch
-from click import prompt
 from torch import Tensor
 import torch.nn as nn
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
@@ -65,7 +64,8 @@ class Mlp(nn.Module):
                                 shared_mode=tadmtl.SHARED_MODE,
                                 taskfilter=tadmtl.DTF,
                                 prompt_cfg = prompt_cfg,
-                                layer_name='fc1')
+                                layer_name='fc1',
+                                enabled=tadmtl.FC1_ENABLED)
 
         self.act = act_layer()
 
@@ -77,7 +77,8 @@ class Mlp(nn.Module):
                                 shared_mode=tadmtl.SHARED_MODE,
                                 taskfilter=tadmtl.DTF,
                                 prompt_cfg = prompt_cfg,
-                                layer_name='fc2')
+                                layer_name='fc2',
+                                enabled=tadmtl.FC2_ENABLED)
 
         self.tasks = tasks
         self.drop = nn.Dropout(drop)
@@ -165,6 +166,7 @@ class WindowAttention(nn.Module):
 
         self.prompt_cfg = prompt_cfg
         self.prompt_len = prompt_cfg.PERTASK_LEN * len(tasks)
+        self.tpc_enabled = tadmtl.TPC.ENABLED
 
         # define a parameter table of relative position bias
         self.relative_position_bias_table = nn.Parameter(
@@ -190,7 +192,8 @@ class WindowAttention(nn.Module):
         self.qkv = TAModuleLinear(dim, dim * 3, r=tadmtl.R[layer_idx],
                                 lora_shared_scale=tadmtl.SHARED_SCALE[layer_idx], lora_dropout=tadmtl.DROPOUT[layer_idx], tasks=None, bias=qkv_bias,
                                 trainable_scale_shared=tadmtl.TRAINABLE_SCALE_SHARED, shared_mode=tadmtl.SHARED_MODE,
-                                taskfilter=tadmtl.TPC)
+                                taskfilter=tadmtl.TPC,
+                                enabled=tadmtl.QKV_ENABLED)
 
         self.attn_drop = nn.Dropout(attn_drop)
 
@@ -204,7 +207,8 @@ class WindowAttention(nn.Module):
                                  shared_mode=tadmtl.SHARED_MODE,
                                  taskfilter=tadmtl.DTF,
                                  layer_name='proj',
-                                 prompt_cfg = prompt_cfg)
+                                 prompt_cfg = prompt_cfg,
+                                 enabled=tadmtl.PROJ_ENABLED)
 
         self.tasks = tasks
         self.proj_drop = nn.Dropout(proj_drop)
@@ -212,7 +216,7 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-        self.attn_weight_processing = nn.GELU()
+        self.attn_weight_processing = nn.GELU() if self.tpc_enabled else None
 
     def forward(self, x, spa_prompts, mask=None,hw_shapes=None, attn_weight_list=None):
         """
@@ -226,7 +230,9 @@ class WindowAttention(nn.Module):
         nW = B_ // spa_prompts.shape[0]
         prompts_len = self.prompt_cfg.PERTASK_LEN * len(self.tasks)
         spa_prompts = spa_prompts[:, None, :, :].expand(-1, nW, -1, -1).clone().reshape(-1, prompts_len, self.dim)
-
+        # Swin uses window-local attention. Concatenating the shared prompt set to
+        # each window preserves the paper's prompt-conditioning semantics without
+        # rewriting the backbone into a global-token encoder.
         x = torch.cat([spa_prompts, x], dim=1)
         B_, N, C = x.shape
 
@@ -263,15 +269,17 @@ class WindowAttention(nn.Module):
         # reshaping of attn_weight
         attn_weight = attn_weight[:, :, :self.prompt_len, self.prompt_len:] # (B*nW, nH, T, wh*ww)
 
-        ori_attn_weight =attn_weight
-
+        ori_attn_weight = attn_weight
+        processed_attn_weight = None
         if self.attn_weight_processing is not None:
-            proceesed_attn_weight = self.attn_weight_processing(attn_weight)
+            # We keep the release's pre-softmax qk^T slice + GELU processing as
+            # the concrete TPC attention representation under Swin window attention.
+            processed_attn_weight = self.attn_weight_processing(attn_weight)
 
         # Append attn_weight
         attn_weight_list.append(ori_attn_weight)
 
-        x, x_proj_lora_tasks = self.proj(x,hw_shapes=hw_shapes, attn_weight=proceesed_attn_weight)
+        x, x_proj_lora_tasks = self.proj(x, hw_shapes=hw_shapes, attn_weight=processed_attn_weight)
         x = self.proj_drop(x)
 
         spa_prompts, x = sep_prompt(x, self.prompt_len)  # spa_prompts: (B*nW, T, C)
@@ -466,15 +474,15 @@ class SwinTransformerBlock(nn.Module):
                 attn_windows, self.window_size, H, W)  # B H' W' C
             x = shifted_x
 
-        if attn_windows_lora_tasks is not None:
-
+        stage_skip_features = getattr(self.attn.proj, "task_skip_feature", None)
+        if attn_windows_lora_tasks is not None and stage_skip_features:
             for task in self.tasks:
-                self.attn.proj.task_skip_feature[task] = self.attn.proj.task_skip_feature[task].view(-1, self.window_size, self.window_size, C)
-                self.attn.proj.task_skip_feature[task] = window_reverse(self.attn.proj.task_skip_feature[task], self.window_size, H, W)
+                stage_skip_features[task] = stage_skip_features[task].view(-1, self.window_size, self.window_size, C)
+                stage_skip_features[task] = window_reverse(stage_skip_features[task], self.window_size, H, W)
 
                 if self.shift_size > 0:
-                    self.attn.proj.task_skip_feature[task] = torch.roll(self.attn.proj.task_skip_feature[task], shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-                self.attn.proj.task_skip_feature[task] = self.attn.proj.task_skip_feature[task].view(B, H*W, C)
+                    stage_skip_features[task] = torch.roll(stage_skip_features[task], shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+                stage_skip_features[task] = stage_skip_features[task].view(B, H*W, C)
 
 
         if attn_windows_lora_tasks is not None:
@@ -676,20 +684,18 @@ class BasicLayer(nn.Module):
         for idx, blk in enumerate(self.blocks):
             x, tasks_lora, task_prompts, attn_weight_list = blk(x, task_prompts, attn_weight_list)
 
-        for t_idx, task in enumerate(self.tasks):
-            # print(self.blocks[-1].attn.proj.task_skip_feature[task].shape)
-            cur_feature = self.blocks[-1].attn.proj.task_skip_feature[task]
+        stage_skip_features = getattr(self.blocks[-1].attn.proj, "task_skip_feature", None)
+        if tasks_lora is not None and stage_skip_features:
+            gate_clipped = torch.sigmoid(self.prompt_gate)
 
-            import torch.nn.functional as F
+            for task in self.tasks:
+                cur_feature = stage_skip_features[task]
 
-            gate_clipped = F.sigmoid(self.prompt_gate)
-
-            if self.tadmtl.ABLATION.SKIPCONNECTION:
-                #tasks_lora[task] = cur_feature * gate_clipped + (1 - gate_clipped) * tasks_lora[task]
-                if self.tadmtl.ABLATION.STAGEWISEGATING:
-                    tasks_lora[task] = cur_feature * gate_clipped + (1 - gate_clipped) * tasks_lora[task]
-                else:
-                    tasks_lora[task] = (cur_feature + tasks_lora[task]) * 0.5
+                if self.tadmtl.ABLATION.SKIPCONNECTION:
+                    if self.tadmtl.ABLATION.STAGEWISEGATING:
+                        tasks_lora[task] = cur_feature * gate_clipped + (1 - gate_clipped) * tasks_lora[task]
+                    else:
+                        tasks_lora[task] = (cur_feature + tasks_lora[task]) * 0.5
 
 
 

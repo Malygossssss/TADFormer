@@ -158,6 +158,11 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
             logger.warning("=============Unexpected Keys==============")
             for k in unexpected:
                 logger.warning(k)
+        if config.MODEL.TADMTL.ENABLED and config.MODEL.TADMTL.DTF.ENABLED:
+            missing_dtf = [k for k in missing if "lora_filter" in k]
+            unexpected_static = [k for k in unexpected if "conv2d" in k and "lora_filter" in k]
+            if missing_dtf or unexpected_static:
+                logger.warning("Dynamic DTF is enabled. Missing new lora_filter weights or leftover static-filter checkpoint keys are expected when loading older releases.")
     max_accuracy = 0.0
     if not config.EVAL_MODE and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint and not skip_decoder:
         optimizer.load_state_dict(checkpoint["optimizer"])

@@ -26,8 +26,8 @@ def build_model(config, is_pretrain=False):
         layernorm = nn.LayerNorm
 
     if model_type == 'swin':
-        if config.MODEL.TADMTL.ENABLED and config.MODEL.TADMTL.DTF.ENABLED:
-            print("SwinTransformerPromptMTLoRA")
+        if config.MODEL.TADMTL.ENABLED:
+            print("SwinTransformerTADFormer")
 
             model = SwinTransformerTADFormer(img_size=config.DATA.IMG_SIZE,
                                           patch_size=config.MODEL.SWIN.PATCH_SIZE,
