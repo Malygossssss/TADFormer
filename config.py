@@ -15,6 +15,12 @@ import re
 from yacs.config import CfgNode as CN
 from data.mtl_ds import get_tasks_config
 import json
+from ag_mtlora.config_utils import (
+    load_grouping_json,
+    normalize_partition_granularity,
+    resolve_artifact_path,
+    resolve_group_shared_ranks,
+)
 
 _C = CN()
 
@@ -335,6 +341,45 @@ _C.MODEL.TADMTL.TPC.PROMPT_CFG.PERTASK_LEN = 1
 
 _C.MODEL.TADMTL.ABLATION = CN(new_allowed=True)
 
+_C.MODEL.TADMTL.AGMTLORA_ENABLED = False
+_C.MODEL.TADMTL.AGMTLORA_STAGE = 0
+_C.MODEL.TADMTL.AGMTLORA_PARTITION_GRANULARITY = 'global'
+_C.MODEL.TADMTL.AGMTLORA_GROUPS = []
+_C.MODEL.TADMTL.AGMTLORA_GROUP_NAMES = []
+_C.MODEL.TADMTL.AGMTLORA_GROUP_RANKS = []
+_C.MODEL.TADMTL.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
+
+_C.MODEL.AGMTLORA = CN()
+_C.MODEL.AGMTLORA.ENABLED = False
+_C.MODEL.AGMTLORA.STAGE = 1
+_C.MODEL.AGMTLORA.PARTITION_GRANULARITY = 'global'
+_C.MODEL.AGMTLORA.SEARCH_SCORE_SOURCE = 'group_proxy'
+_C.MODEL.AGMTLORA.MAX_GROUPS = 2
+_C.MODEL.AGMTLORA.TOTAL_SHARED_RANK_BUDGET = 64
+_C.MODEL.AGMTLORA.GROUP_SHARED_RANKS = []
+_C.MODEL.AGMTLORA.GROUP_RANK_ALLOCATION = 'equal_split'
+_C.MODEL.AGMTLORA.GROUPING_SOURCE = 'search'
+_C.MODEL.AGMTLORA.GROUPING_JSON = ''
+_C.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS = 5
+_C.MODEL.AGMTLORA.AFFINITY_WARMUP_EPOCHS = -1
+_C.MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS = 50
+_C.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = ''
+_C.MODEL.AGMTLORA.GROUPING_SAVE_PATH = ''
+_C.MODEL.AGMTLORA.DATA_SPLIT_MODE = 'train_meta_strict'
+_C.MODEL.AGMTLORA.META_VAL_RATIO = 0.2
+_C.MODEL.AGMTLORA.META_SPLIT_SEED = -1
+_C.MODEL.AGMTLORA.META_SPLIT_SAVE_PATH = ''
+_C.MODEL.AGMTLORA.RESOLVED_META_SPLIT_SEED = 0
+_C.MODEL.AGMTLORA.SEARCH_OBJECTIVE = 'mean_group_proxy'
+_C.MODEL.AGMTLORA.VISUALIZE_SYMMETRIC_AFFINITY = True
+_C.MODEL.AGMTLORA.RESOLVED_GROUPS = []
+_C.MODEL.AGMTLORA.RESOLVED_GROUP_NAMES = []
+_C.MODEL.AGMTLORA.RESOLVED_GROUP_SHARED_RANKS = []
+_C.MODEL.AGMTLORA.RESOLVED_GROUP_RANK_SOURCE = ''
+_C.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS = 0
+_C.MODEL.AGMTLORA.RESOLVED_PARTITION_GRANULARITY = 'global'
+_C.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP = CN(new_allowed=True)
+
 
 # Visualization
 _C.VIS = CN(new_allowed=True)
@@ -461,6 +506,8 @@ def update_config(config, args):
             config.AMP_ENABLE = False
     if _check_args('disable_amp'):
         config.AMP_ENABLE = False
+    if _check_args('seed'):
+        config.SEED = args.seed
     if _check_args('output'):
         config.OUTPUT = args.output
     if _check_args('tag'):
@@ -560,6 +607,110 @@ def update_config(config, args):
                 else:
                     assert len(config.MODEL.TADMTL.SCALE_PER_TASK[task]) == len(
                         config.MODEL.SWIN.DEPTHS), "TADMTL task scale length should be the same as the number of layers"
+
+    config.MODEL.TADMTL.AGMTLORA_ENABLED = False
+    config.MODEL.TADMTL.AGMTLORA_STAGE = 0
+    config.MODEL.TADMTL.AGMTLORA_PARTITION_GRANULARITY = "global"
+    config.MODEL.TADMTL.AGMTLORA_GROUPS = []
+    config.MODEL.TADMTL.AGMTLORA_GROUP_NAMES = []
+    config.MODEL.TADMTL.AGMTLORA_GROUP_RANKS = []
+    config.MODEL.TADMTL.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
+
+    if config.MODEL.AGMTLORA.ENABLED:
+        if not config.MODEL.TADMTL.ENABLED:
+            raise ValueError("AG-TADFormer requires MODEL.TADMTL.ENABLED=True.")
+        if int(config.MODEL.AGMTLORA.STAGE) != 1:
+            raise ValueError("Only AG-TADFormer Stage-1 is currently supported.")
+        if str(config.MODEL.AGMTLORA.SEARCH_SCORE_SOURCE) != "group_proxy":
+            raise ValueError("This TADFormer port supports only MODEL.AGMTLORA.SEARCH_SCORE_SOURCE='group_proxy'.")
+        config.MODEL.AGMTLORA.PARTITION_GRANULARITY = normalize_partition_granularity(
+            config.MODEL.AGMTLORA.PARTITION_GRANULARITY
+        )
+        if str(config.MODEL.AGMTLORA.DATA_SPLIT_MODE) not in {"train_meta_strict", "official_val"}:
+            raise ValueError("MODEL.AGMTLORA.DATA_SPLIT_MODE must be one of {'train_meta_strict', 'official_val'}.")
+        if not 0.0 < float(config.MODEL.AGMTLORA.META_VAL_RATIO) < 1.0:
+            raise ValueError("MODEL.AGMTLORA.META_VAL_RATIO must satisfy 0 < META_VAL_RATIO < 1.")
+        if int(config.MODEL.AGMTLORA.META_SPLIT_SEED) < 0:
+            config.MODEL.AGMTLORA.RESOLVED_META_SPLIT_SEED = int(config.SEED)
+        else:
+            config.MODEL.AGMTLORA.RESOLVED_META_SPLIT_SEED = int(config.MODEL.AGMTLORA.META_SPLIT_SEED)
+        if int(config.MODEL.AGMTLORA.AFFINITY_WARMUP_EPOCHS) < 0:
+            config.MODEL.AGMTLORA.AFFINITY_WARMUP_EPOCHS = int(config.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS)
+        if int(config.MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS) < 0:
+            raise ValueError("MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS must be >= 0.")
+
+        config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = resolve_artifact_path(
+            config.OUTPUT,
+            config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH,
+            "ag_mtlora_stage1/affinity.json",
+        )
+        config.MODEL.AGMTLORA.GROUPING_SAVE_PATH = resolve_artifact_path(
+            config.OUTPUT,
+            config.MODEL.AGMTLORA.GROUPING_SAVE_PATH,
+            "ag_mtlora_stage1/grouping.json",
+        )
+        config.MODEL.AGMTLORA.META_SPLIT_SAVE_PATH = resolve_artifact_path(
+            config.OUTPUT,
+            config.MODEL.AGMTLORA.META_SPLIT_SAVE_PATH,
+            "ag_mtlora_stage1/meta_split.json",
+        )
+        if config.MODEL.AGMTLORA.GROUPING_JSON:
+            config.MODEL.AGMTLORA.GROUPING_JSON = resolve_artifact_path(
+                config.OUTPUT,
+                config.MODEL.AGMTLORA.GROUPING_JSON,
+                config.MODEL.AGMTLORA.GROUPING_JSON,
+            )
+
+        config.MODEL.AGMTLORA.RESOLVED_GROUPS = []
+        config.MODEL.AGMTLORA.RESOLVED_GROUP_NAMES = []
+        config.MODEL.AGMTLORA.RESOLVED_GROUP_SHARED_RANKS = []
+        config.MODEL.AGMTLORA.RESOLVED_GROUP_RANK_SOURCE = ""
+        config.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS = 0
+        config.MODEL.AGMTLORA.RESOLVED_PARTITION_GRANULARITY = config.MODEL.AGMTLORA.PARTITION_GRANULARITY
+        config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP = CN(new_allowed=True)
+
+        if str(config.MODEL.AGMTLORA.GROUPING_SOURCE) == "fixed_json":
+            if not config.MODEL.AGMTLORA.GROUPING_JSON:
+                raise ValueError("MODEL.AGMTLORA.GROUPING_JSON is required when GROUPING_SOURCE=fixed_json.")
+            grouping_payload = load_grouping_json(config.MODEL.AGMTLORA.GROUPING_JSON, config.TASKS)
+            resolved_groups = grouping_payload["groups"]
+            resolved_task_to_group = grouping_payload["task_to_group"]
+            resolved_group_names = [f"group_{idx}" for idx in range(len(resolved_groups))]
+            manual_group_ranks = config.MODEL.AGMTLORA.GROUP_SHARED_RANKS
+            rank_source = ""
+            if (not manual_group_ranks) and grouping_payload.get("group_shared_ranks"):
+                manual_group_ranks = grouping_payload["group_shared_ranks"]
+                rank_source = "grouping_json"
+            resolved_group_ranks, resolved_rank_source = resolve_group_shared_ranks(
+                manual_group_ranks,
+                int(config.MODEL.AGMTLORA.TOTAL_SHARED_RANK_BUDGET),
+                len(resolved_groups),
+                len(config.MODEL.SWIN.DEPTHS),
+                str(config.MODEL.AGMTLORA.GROUP_RANK_ALLOCATION),
+            )
+            if rank_source != "grouping_json":
+                rank_source = resolved_rank_source
+
+            config.MODEL.AGMTLORA.RESOLVED_GROUPS = resolved_groups
+            config.MODEL.AGMTLORA.RESOLVED_GROUP_NAMES = resolved_group_names
+            config.MODEL.AGMTLORA.RESOLVED_GROUP_SHARED_RANKS = resolved_group_ranks
+            config.MODEL.AGMTLORA.RESOLVED_GROUP_RANK_SOURCE = rank_source
+            config.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS = len(resolved_groups)
+            config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP = CN(new_allowed=True)
+            for task, group_name in resolved_task_to_group.items():
+                config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP[task] = group_name
+
+            config.MODEL.TADMTL.AGMTLORA_ENABLED = True
+            config.MODEL.TADMTL.AGMTLORA_STAGE = int(config.MODEL.AGMTLORA.STAGE)
+            config.MODEL.TADMTL.AGMTLORA_PARTITION_GRANULARITY = config.MODEL.AGMTLORA.PARTITION_GRANULARITY
+            config.MODEL.TADMTL.AGMTLORA_GROUPS = resolved_groups
+            config.MODEL.TADMTL.AGMTLORA_GROUP_NAMES = resolved_group_names
+            config.MODEL.TADMTL.AGMTLORA_GROUP_RANKS = resolved_group_ranks
+            config.MODEL.TADMTL.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
+            for task, group_name in resolved_task_to_group.items():
+                config.MODEL.TADMTL.AGMTLORA_TASK_TO_GROUP[task] = group_name
+        elif str(config.MODEL.AGMTLORA.GROUPING_SOURCE) != "search":
+            raise ValueError("MODEL.AGMTLORA.GROUPING_SOURCE must be either 'search' or 'fixed_json'.")
 
     config.freeze()
 

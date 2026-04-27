@@ -39,6 +39,42 @@ def sep_prompt(x, prompt_length):
     x = x[:, prompt_length:, :]
     return prompt, x
 
+
+def _agmtlora_enabled(tadmtl) -> bool:
+    return bool(tadmtl is not None and getattr(tadmtl, "AGMTLORA_ENABLED", False))
+
+
+def _agmtlora_task_to_group(tadmtl):
+    if not _agmtlora_enabled(tadmtl):
+        return None
+    return tadmtl.AGMTLORA_TASK_TO_GROUP
+
+
+def _tadmtl_rank_for_layer(tadmtl, layer_idx: int):
+    if not _agmtlora_enabled(tadmtl):
+        return tadmtl.R[layer_idx]
+    group_names = list(tadmtl.AGMTLORA_GROUP_NAMES)
+    group_ranks = list(tadmtl.AGMTLORA_GROUP_RANKS)
+    ranks = {}
+    for group_name, rank_spec in zip(group_names, group_ranks):
+        if isinstance(rank_spec, (list, tuple)):
+            if len(rank_spec) == 0:
+                rank = 0
+            elif layer_idx < len(rank_spec):
+                rank = rank_spec[layer_idx]
+            else:
+                rank = rank_spec[-1]
+        else:
+            rank = rank_spec
+        ranks[str(group_name)] = int(rank)
+    return ranks
+
+
+def _route_tasks_for_ta(lora: bool, tasks, tadmtl):
+    if _agmtlora_enabled(tadmtl) or lora or tadmtl.INTERMEDIATE_SPECIALIZATION:
+        return tasks
+    return None
+
 class CompatLinear(nn.Linear):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -56,29 +92,35 @@ class Mlp(nn.Module):
 
         self.prompt_cfg = prompt_cfg
 
-        self.fc1 = TAModuleLinear(in_features, hidden_features, r=tadmtl.R[layer_idx],
+        ta_rank = _tadmtl_rank_for_layer(tadmtl, layer_idx)
+        ta_tasks = _route_tasks_for_ta(lora, tasks, tadmtl)
+        task_to_group = _agmtlora_task_to_group(tadmtl)
+
+        self.fc1 = TAModuleLinear(in_features, hidden_features, r=ta_rank,
                                 lora_shared_scale=tadmtl.SHARED_SCALE[layer_idx],
-                                lora_dropout=tadmtl.DROPOUT[layer_idx], tasks=(
-                tasks if (lora or tadmtl.INTERMEDIATE_SPECIALIZATION) else None),
+                                lora_dropout=tadmtl.DROPOUT[layer_idx], tasks=ta_tasks,
                                 trainable_scale_shared=tadmtl.TRAINABLE_SCALE_SHARED,
                                 shared_mode=tadmtl.SHARED_MODE,
                                 taskfilter=tadmtl.DTF,
                                 prompt_cfg = prompt_cfg,
                                 layer_name='fc1',
-                                enabled=tadmtl.FC1_ENABLED)
+                                enabled=tadmtl.FC1_ENABLED,
+                                task_to_group=task_to_group,
+                                layer_idx=layer_idx)
 
         self.act = act_layer()
 
-        self.fc2 = TAModuleLinear(hidden_features, out_features, r=tadmtl.R[layer_idx],
+        self.fc2 = TAModuleLinear(hidden_features, out_features, r=ta_rank,
                                 lora_shared_scale=tadmtl.SHARED_SCALE[layer_idx],
-                                lora_dropout=tadmtl.DROPOUT[layer_idx], tasks=(
-                tasks if (lora or tadmtl.INTERMEDIATE_SPECIALIZATION) else None),
+                                lora_dropout=tadmtl.DROPOUT[layer_idx], tasks=ta_tasks,
                                 trainable_scale_shared=tadmtl.TRAINABLE_SCALE_SHARED,
                                 shared_mode=tadmtl.SHARED_MODE,
                                 taskfilter=tadmtl.DTF,
                                 prompt_cfg = prompt_cfg,
                                 layer_name='fc2',
-                                enabled=tadmtl.FC2_ENABLED)
+                                enabled=tadmtl.FC2_ENABLED,
+                                task_to_group=task_to_group,
+                                layer_idx=layer_idx)
 
         self.tasks = tasks
         self.drop = nn.Dropout(drop)
@@ -167,6 +209,11 @@ class WindowAttention(nn.Module):
         self.prompt_cfg = prompt_cfg
         self.prompt_len = prompt_cfg.PERTASK_LEN * len(tasks)
         self.tpc_enabled = tadmtl.TPC.ENABLED
+        self.agmtlora_enabled = _agmtlora_enabled(tadmtl)
+        ta_rank = _tadmtl_rank_for_layer(tadmtl, layer_idx)
+        task_to_group = _agmtlora_task_to_group(tadmtl)
+        qkv_tasks = tasks if self.agmtlora_enabled else None
+        proj_tasks = _route_tasks_for_ta(lora, tasks, tadmtl)
 
         # define a parameter table of relative position bias
         self.relative_position_bias_table = nn.Parameter(
@@ -189,26 +236,29 @@ class WindowAttention(nn.Module):
         self.register_buffer("relative_position_index",
                              relative_position_index)
 
-        self.qkv = TAModuleLinear(dim, dim * 3, r=tadmtl.R[layer_idx],
-                                lora_shared_scale=tadmtl.SHARED_SCALE[layer_idx], lora_dropout=tadmtl.DROPOUT[layer_idx], tasks=None, bias=qkv_bias,
+        self.qkv = TAModuleLinear(dim, dim * 3, r=ta_rank,
+                                lora_shared_scale=tadmtl.SHARED_SCALE[layer_idx], lora_dropout=tadmtl.DROPOUT[layer_idx], tasks=qkv_tasks, bias=qkv_bias,
                                 trainable_scale_shared=tadmtl.TRAINABLE_SCALE_SHARED, shared_mode=tadmtl.SHARED_MODE,
-                                taskfilter=tadmtl.TPC,
-                                enabled=tadmtl.QKV_ENABLED)
+                                taskfilter=None if self.agmtlora_enabled else tadmtl.TPC,
+                                enabled=tadmtl.QKV_ENABLED,
+                                task_to_group=task_to_group,
+                                layer_idx=layer_idx)
 
         self.attn_drop = nn.Dropout(attn_drop)
 
 
 
-        self.proj = TAModuleLinear(dim, dim, r=tadmtl.R[layer_idx],
+        self.proj = TAModuleLinear(dim, dim, r=ta_rank,
                                  lora_shared_scale=tadmtl.SHARED_SCALE[layer_idx],
-                                 lora_dropout=tadmtl.DROPOUT[layer_idx], tasks=(
-            tasks if (lora or tadmtl.INTERMEDIATE_SPECIALIZATION) else None),
+                                 lora_dropout=tadmtl.DROPOUT[layer_idx], tasks=proj_tasks,
                                  trainable_scale_shared=tadmtl.TRAINABLE_SCALE_SHARED,
                                  shared_mode=tadmtl.SHARED_MODE,
                                  taskfilter=tadmtl.DTF,
                                  layer_name='proj',
                                  prompt_cfg = prompt_cfg,
-                                 enabled=tadmtl.PROJ_ENABLED)
+                                 enabled=tadmtl.PROJ_ENABLED,
+                                 task_to_group=task_to_group,
+                                 layer_idx=layer_idx)
 
         self.tasks = tasks
         self.proj_drop = nn.Dropout(proj_drop)
@@ -217,6 +267,37 @@ class WindowAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
         self.attn_weight_processing = nn.GELU() if self.tpc_enabled else None
+
+    def _attention_from_qkv(self, qkv, B_, N, C, mask):
+        qkv = qkv.reshape(B_, N, 3, self.num_heads, C //
+                          self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn_weight = q @ k.transpose(-2, -1)
+        attn = attn_weight * self.scale
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn[:, :, self.prompt_len:, self.prompt_len:] = (
+            attn[:, :, self.prompt_len:, self.prompt_len:] + relative_position_bias.unsqueeze(0)
+        )
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N)
+            attn[:, :, :, self.prompt_len:, self.prompt_len:] = (
+                attn[:, :, :, self.prompt_len:, self.prompt_len:] + mask.unsqueeze(1).unsqueeze(0)
+            )
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        attn_weight = attn_weight[:, :, :self.prompt_len, self.prompt_len:]
+        return x, attn_weight
 
     def forward(self, x, spa_prompts, mask=None,hw_shapes=None, attn_weight_list=None):
         """
@@ -236,38 +317,8 @@ class WindowAttention(nn.Module):
         x = torch.cat([spa_prompts, x], dim=1)
         B_, N, C = x.shape
 
-        qkv, _ = self.qkv(x)
-        qkv = qkv.reshape(B_, N, 3, self.num_heads, C //
-                          self.num_heads).permute(2, 0, 3, 1, 4)
-        # make torchscript happy (cannot use tensor as tuple)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        attn_weight = (q @ k.transpose(-2, -1))  # (B*nW, nH, N, N), N=nPrompts+Wh*Ww
-
-        attn = attn_weight * self.scale
-
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-
-        #attn = attn + relative_position_bias.unsqueeze(0)
-        attn[:, :, self.prompt_len:, self.prompt_len:] = attn[:, :, self.prompt_len:, self.prompt_len:] + relative_position_bias.unsqueeze(0)
-
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N)  # + mask.unsqueeze(1).unsqueeze(0)
-            attn[:, :, :, self.prompt_len:, self.prompt_len:] = attn[:, :, :, self.prompt_len:,self.prompt_len:] + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
-
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C) # B*nW, Wh*Ww+T, C
-
-        # reshaping of attn_weight
-        attn_weight = attn_weight[:, :, :self.prompt_len, self.prompt_len:] # (B*nW, nH, T, wh*ww)
+        qkv, qkv_lora_tasks = self.qkv(x)
+        x, attn_weight = self._attention_from_qkv(qkv, B_, N, C, mask)
 
         ori_attn_weight = attn_weight
         processed_attn_weight = None
@@ -276,10 +327,22 @@ class WindowAttention(nn.Module):
             # the concrete TPC attention representation under Swin window attention.
             processed_attn_weight = self.attn_weight_processing(attn_weight)
 
+        x_proj_inputs = None
+        if qkv_lora_tasks is not None:
+            x_proj_inputs = {}
+            task_processed_attn_weight = {} if self.attn_weight_processing is not None else None
+            for task in self.tasks:
+                task_x, task_attn_weight = self._attention_from_qkv(qkv_lora_tasks[task], B_, N, C, mask)
+                x_proj_inputs[task] = task_x
+                if task_processed_attn_weight is not None:
+                    task_processed_attn_weight[task] = self.attn_weight_processing(task_attn_weight)
+            if task_processed_attn_weight is not None:
+                processed_attn_weight = task_processed_attn_weight
+
         # Append attn_weight
         attn_weight_list.append(ori_attn_weight)
 
-        x, x_proj_lora_tasks = self.proj(x, hw_shapes=hw_shapes, attn_weight=processed_attn_weight)
+        x, x_proj_lora_tasks = self.proj(x, x_proj_inputs, hw_shapes=hw_shapes, attn_weight=processed_attn_weight)
         x = self.proj_drop(x)
 
         spa_prompts, x = sep_prompt(x, self.prompt_len)  # spa_prompts: (B*nW, T, C)

@@ -25,6 +25,50 @@ import torch.nn.functional as F
 from models.lora import map_old_state_dict_weights
 
 
+def _copy_rank_aligned_tensor(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    copied = target.clone()
+    if source.ndim != target.ndim:
+        return copied
+    slices = tuple(slice(0, min(int(src_dim), int(dst_dim))) for src_dim, dst_dim in zip(source.shape, target.shape))
+    copied[slices] = source.to(device=target.device, dtype=target.dtype)[slices]
+    return copied
+
+
+def _expand_agmtlora_shared_state(model_state, target_state, config, logger=None):
+    try:
+        ag_enabled = bool(config.MODEL.TADMTL.AGMTLORA_ENABLED)
+        group_names = list(config.MODEL.TADMTL.AGMTLORA_GROUP_NAMES)
+    except Exception:
+        return model_state
+    if not ag_enabled or not group_names:
+        return model_state
+
+    expanded = dict(model_state)
+    copied_count = 0
+    suffix_pairs = (
+        (".lora_shared_A", ".lora_shared_A_groups"),
+        (".lora_shared_B", ".lora_shared_B_groups"),
+        (".lora_shared_scale", ".lora_shared_scale_groups"),
+    )
+    for source_key, source_tensor in list(model_state.items()):
+        if not torch.is_tensor(source_tensor) or "_groups" in source_key:
+            continue
+        for source_suffix, target_suffix in suffix_pairs:
+            if not source_key.endswith(source_suffix):
+                continue
+            module_prefix = source_key[: -len(source_suffix)]
+            for group_name in group_names:
+                target_key = f"{module_prefix}{target_suffix}.{group_name}"
+                if target_key not in target_state:
+                    continue
+                expanded[target_key] = _copy_rank_aligned_tensor(source_tensor, target_state[target_key])
+                copied_count += 1
+            break
+    if copied_count and logger is not None:
+        logger.info("Expanded %d single shared TA-LoRA checkpoint tensors into AG-TADFormer group banks.", copied_count)
+    return expanded
+
+
 
 def mkdir_if_missing(directory):
     if not os.path.exists(directory):
@@ -148,6 +192,7 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
             print("No keys needs to be mapped for LoRA")
         model_state = map_old_state_dict_weights(
             model_state, mapping, "", config.MODEL.TADMTL.SPLIT_QKV)
+    model_state = _expand_agmtlora_shared_state(model_state, model.state_dict(), config, logger=logger)
     missing, unexpected = model.load_state_dict(model_state, strict=False)
     if not quiet:
         if len(missing) > 0:

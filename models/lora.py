@@ -516,6 +516,8 @@ class TAModuleLinear(LoRALayer):
         layer_name: str = None,
         prompt_cfg = None,
         enabled: bool = True,
+        task_to_group: Mapping[str, str] = None,
+        layer_idx: int = -1,
 
         **kwargs,
     ):
@@ -525,61 +527,113 @@ class TAModuleLinear(LoRALayer):
             shared_mode = 'addition'
         if shared_mode == 'lora_only':
             tasks = None
-        has_tasks = tasks is not None
-        if not has_tasks:
-            if shared_mode not in ['matrix']:
-                shared_mode = 'matrix'
 
         if isinstance(r, int):
-            r = {'shared': r}
-        effective_r = r['shared'] if enabled else 0
+            r = {'shared': int(r)}
+        else:
+            r = {str(key): int(value) for key, value in r.items()}
+
+        group_ranks = {group: rank for group, rank in r.items() if group != 'shared'}
+        has_tasks = tasks is not None
+        ag_enabled = bool(enabled and has_tasks and len(group_ranks) > 0)
+        shared_rank = max(group_ranks.values()) if ag_enabled else int(r.get('shared', 0))
+        effective_r = shared_rank if enabled else 0
+
+        if ag_enabled and shared_mode != 'matrix':
+            raise ValueError("AG-TADFormer grouped TA-LoRA currently supports shared_mode='matrix' only.")
+        if not has_tasks and shared_mode not in ['matrix']:
+            shared_mode = 'matrix'
+
         super().__init__(
             r=effective_r, lora_alpha=lora_shared_scale, lora_dropout=lora_dropout)
         self.linear = torch.nn.Linear(
             in_features, out_features, **kwargs)
 
         self.enabled = enabled
-        self.tasks = tasks if enabled else None
+        self.tasks = list(tasks) if enabled and tasks is not None else None
         self.shared_mode = shared_mode
         self.layer_name = layer_name
+        self.layer_idx = int(layer_idx)
         self.shared_r = effective_r
         self.prompt_cfg = prompt_cfg
         self.lora_filter = None
+        self.lora_filter_groups = None
         self.taskfilter_cfg = taskfilter
         self.taskfilter = bool(self.tasks is not None and cfg_enabled(taskfilter, default=False))
         self.prompt_len = self.prompt_cfg.PERTASK_LEN * len(self.tasks) if self.prompt_cfg is not None and self.tasks is not None else 0
 
+        self.ag_enabled = bool(ag_enabled)
+        self.group_shared_ranks = group_ranks if self.ag_enabled else {}
+        self.group_names = list(group_ranks.keys()) if self.ag_enabled else []
+        self.task_to_group = {}
+        if self.ag_enabled:
+            if task_to_group is None:
+                raise ValueError("AG-TADFormer grouped TA-LoRA requires task_to_group.")
+            task_to_group = dict(task_to_group.items()) if hasattr(task_to_group, "items") else dict(task_to_group)
+            for task in self.tasks:
+                group_name = str(task_to_group.get(task, ""))
+                if group_name not in self.group_shared_ranks:
+                    raise ValueError(f"Task '{task}' maps to unknown AG-TADFormer group '{group_name}'.")
+                self.task_to_group[task] = group_name
+
         if self.shared_r > 0:
-            if self.taskfilter:
-                self.lora_filter = DTF(self.shared_r, kernel_size=3, stride=1, padding=1, groups=self.shared_r,
-                                       prompt_cfg=prompt_cfg)
+            if prompt_cfg is not None and layer_name == "proj":
+                self.prompt_layernorm = nn.LayerNorm(in_features)
+                self.task_skip_feature = {}
 
-
-            if prompt_cfg is not None :
-                if layer_name == "proj" :
-                    self.prompt_layernorm = nn.LayerNorm(in_features)
-                    self.task_skip_feature = {}
-
-            if self.shared_mode == 'addition':
-                assert has_tasks
-                self.lora_norm = nn.LayerNorm(out_features)
-            elif self.shared_mode == 'matrix' or self.shared_mode == 'matrixv2':
-
-                self.lora_shared_A = nn.Parameter(
-                    self.linear.weight.new_zeros((r['shared'], in_features)))
-                self.lora_shared_B = nn.Parameter(
-                    self.linear.weight.new_zeros((out_features, r['shared'])))
-
+            if self.ag_enabled:
+                self.lora_shared_A_groups = nn.ParameterDict()
+                self.lora_shared_B_groups = nn.ParameterDict()
+                for group_name, group_rank in self.group_shared_ranks.items():
+                    if int(group_rank) <= 0:
+                        continue
+                    self.lora_shared_A_groups[group_name] = nn.Parameter(
+                        self.linear.weight.new_zeros((int(group_rank), in_features)))
+                    self.lora_shared_B_groups[group_name] = nn.Parameter(
+                        self.linear.weight.new_zeros((out_features, int(group_rank))))
+                if self.taskfilter:
+                    self.lora_filter_groups = nn.ModuleDict()
+                    for group_name, group_rank in self.group_shared_ranks.items():
+                        if int(group_rank) <= 0:
+                            continue
+                        self.lora_filter_groups[group_name] = DTF(
+                            int(group_rank), kernel_size=3, stride=1, padding=1,
+                            groups=int(group_rank), prompt_cfg=prompt_cfg)
+                if trainable_scale_shared:
+                    self.lora_shared_scale_groups = nn.ParameterDict()
+                    for group_name, group_rank in self.group_shared_ranks.items():
+                        if int(group_rank) <= 0:
+                            continue
+                        self.lora_shared_scale_groups[group_name] = nn.Parameter(
+                            torch.FloatTensor([lora_shared_scale]))
+                else:
+                    self.lora_shared_scale_groups = {
+                        group_name: float(lora_shared_scale)
+                        for group_name, group_rank in self.group_shared_ranks.items()
+                        if int(group_rank) > 0
+                    }
             else:
-                raise NotImplementedError
-            if trainable_scale_shared:
-                self.lora_shared_scale = nn.Parameter(
-                    torch.FloatTensor([lora_shared_scale]))
-            else:
-                self.lora_shared_scale = lora_shared_scale
+                if self.taskfilter:
+                    self.lora_filter = DTF(self.shared_r, kernel_size=3, stride=1, padding=1, groups=self.shared_r,
+                                           prompt_cfg=prompt_cfg)
+                if self.shared_mode == 'addition':
+                    assert has_tasks
+                    self.lora_norm = nn.LayerNorm(out_features)
+                elif self.shared_mode == 'matrix' or self.shared_mode == 'matrixv2':
+                    self.lora_shared_A = nn.Parameter(
+                        self.linear.weight.new_zeros((self.shared_r, in_features)))
+                    self.lora_shared_B = nn.Parameter(
+                        self.linear.weight.new_zeros((out_features, self.shared_r)))
+                else:
+                    raise NotImplementedError
+                if trainable_scale_shared:
+                    self.lora_shared_scale = nn.Parameter(
+                        torch.FloatTensor([lora_shared_scale]))
+                else:
+                    self.lora_shared_scale = lora_shared_scale
             self.reset_parameters()
 
-    def _split_proj_inputs(self, x_tasks: Dict[str, torch.Tensor], attn_weight: torch.Tensor, channel_dim: int):
+    def _split_proj_inputs(self, x_tasks: Dict[str, torch.Tensor], attn_weight, channel_dim: int):
         task_tokens = {}
         for task in self.tasks:
             _, patch_tokens = sep_prompt(x_tasks[task], self.prompt_len)
@@ -593,11 +647,16 @@ class TAModuleLinear(LoRALayer):
                 self.task_skip_feature[task] = task_tokens[task]
             return task_tokens
 
-        nheads = attn_weight.shape[1]
+        first_attn_weight = next(iter(attn_weight.values())) if isinstance(attn_weight, dict) else attn_weight
+        nheads = first_attn_weight.shape[1]
         head_channel_no = channel_dim // nheads
 
         for t_idx, task in enumerate(self.tasks):
-            cur_attn_weight = attn_weight[:, :, t_idx * self.prompt_cfg.PERTASK_LEN:(t_idx + 1) * self.prompt_cfg.PERTASK_LEN, :]
+            task_attn_weight = attn_weight.get(task) if isinstance(attn_weight, dict) else attn_weight
+            if task_attn_weight is None:
+                self.task_skip_feature[task] = task_tokens[task]
+                continue
+            cur_attn_weight = task_attn_weight[:, :, t_idx * self.prompt_cfg.PERTASK_LEN:(t_idx + 1) * self.prompt_cfg.PERTASK_LEN, :]
             patch_tokens = rearrange(task_tokens[task], "bs n c -> bs c n")
             cur_task_fea = []
 
@@ -608,9 +667,6 @@ class TAModuleLinear(LoRALayer):
                 )
 
             cur_task_fea = torch.cat(cur_task_fea, dim=1)
-            # Paper-faithful TA input: TPC first converts prompt-patch attention
-            # into task-adapted patch features, which are then fed into the
-            # projection-layer TA module / DTF path.
             self.task_skip_feature[task] = cur_task_fea.transpose(1, 2).contiguous()
             task_tokens[task] = self.prompt_layernorm((cur_task_fea + patch_tokens).transpose(1, 2).contiguous())
 
@@ -619,10 +675,12 @@ class TAModuleLinear(LoRALayer):
     def reset_parameters(self):
         """Reset all the weights, even including pretrained ones."""
         if hasattr(self, "lora_shared_A"):
-            # initialize A the same way as the default for nn.Linear and B to zero
-            # Wondering why 'a' is equal to math.sqrt(5)?: https://github.com/pytorch/pytorch/issues/15314
             nn.init.kaiming_uniform_(self.lora_shared_A, a=math.sqrt(5))
             nn.init.zeros_(self.lora_shared_B)
+        if hasattr(self, "lora_shared_A_groups"):
+            for group_name in self.lora_shared_A_groups:
+                nn.init.kaiming_uniform_(self.lora_shared_A_groups[group_name], a=math.sqrt(5))
+                nn.init.zeros_(self.lora_shared_B_groups[group_name])
         if hasattr(self, "lora_tasks_A"):
             for task in self.tasks:
                 nn.init.kaiming_uniform_(
@@ -633,6 +691,53 @@ class TAModuleLinear(LoRALayer):
         """Merges the LoRA weights into the full-rank weights (W = W + delta_W)."""
         raise NotImplementedError
 
+    def _get_group_scale(self, group_name: str):
+        scale_groups = self.lora_shared_scale_groups
+        if isinstance(scale_groups, nn.ParameterDict):
+            return scale_groups[group_name]
+        return scale_groups[group_name]
+
+    def _base_task_output(self, pretrained: torch.Tensor):
+        if self.layer_name == "proj":
+            return pretrained[:, self.prompt_len:, :]
+        return pretrained
+
+    def _apply_group_filter(self, group_name: str, x_: torch.Tensor, hw_shapes: tuple):
+        if not self.taskfilter or self.lora_filter_groups is None:
+            return x_
+        if hw_shapes is None:
+            raise ValueError(f"AG-TADFormer task filter requires hw_shapes for layer {self.layer_name}.")
+        B, N, C = x_.size()
+        h, w = hw_shapes
+        assert N == h * w
+        x_ = x_.reshape(B, h, w, C).permute(0, 3, 1, 2)
+        x_ = self.lora_filter_groups[group_name](x_)
+        x_ = x_.permute(0, 2, 3, 1)
+        return x_.reshape(B, N, C)
+
+    def _group_lora(self, group_name: str, task_input: torch.Tensor, hw_shapes: tuple):
+        if group_name not in self.lora_shared_A_groups:
+            return task_input.new_zeros((*task_input.shape[:-1], self.linear.out_features))
+        x_ = task_input @ self.lora_shared_A_groups[group_name].transpose(0, 1)
+        x_ = self._apply_group_filter(group_name, x_, hw_shapes)
+        return x_ @ self.lora_shared_B_groups[group_name].transpose(0, 1) * self._get_group_scale(group_name)
+
+    def _forward_ag(self, pretrained: torch.Tensor, x: torch.Tensor, x_tasks: Dict[str, torch.Tensor] = None,
+                    hw_shapes: tuple = None, attn_weight=None):
+        if self.tasks is None:
+            return pretrained, None
+        if x_tasks is None:
+            x_tasks = {task: x for task in self.tasks}
+        if self.layer_name == "proj":
+            self.task_skip_feature = {}
+            x_tasks = self._split_proj_inputs(x_tasks, attn_weight, x.shape[-1])
+
+        lora_tasks = {}
+        base_task_output = self._base_task_output(pretrained)
+        for task in self.tasks:
+            group_name = self.task_to_group[task]
+            lora_tasks[task] = base_task_output + self._group_lora(group_name, x_tasks[task], hw_shapes)
+        return pretrained, lora_tasks
 
     def forward(self, x: torch.Tensor, x_tasks: Dict[str, torch.Tensor] = None,hw_shapes: tuple =None,
                 attn_weight=None,
@@ -646,6 +751,11 @@ class TAModuleLinear(LoRALayer):
         if self.r == 0:
             return pretrained, None
         x = self.lora_dropout(x)
+
+        if self.ag_enabled:
+            if PROMPT_FLAG:
+                return pretrained, None
+            return self._forward_ag(pretrained, x, x_tasks=x_tasks, hw_shapes=hw_shapes, attn_weight=attn_weight)
 
         if self.shared_mode == 'matrix':
             lora = (x @ self.lora_shared_A.transpose(0, 1)

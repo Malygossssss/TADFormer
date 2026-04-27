@@ -698,19 +698,34 @@ def collate_mil(batch):
     raise TypeError((error_msg.format(type(batch[0]))))
 
 
-def get_mtl_train_dataset(db_name, config, transforms):
-    """ Return the train dataset """
+def get_mtl_split_sample_ids(db_name, root, split='train'):
+    """Return ordered sample ids for an MTL dataset split without loading samples."""
+    if db_name == 'NYUD':
+        split_path = os.path.join(root, 'gt_sets', f'{split}.txt')
+    elif db_name == 'PASCALContext':
+        split_name = ''.join(split) if isinstance(split, (list, tuple)) else split
+        split_path = os.path.join(root, 'ImageSets', 'Context', f'{split_name}.txt')
+    else:
+        raise NotImplemented("db_name: Choose among PASCALContext and NYUD")
 
-    print('Preparing train loader for db: {}'.format(db_name))
+    with open(split_path, 'r') as handle:
+        return [line.strip() for line in handle.read().splitlines() if line.strip()]
+
+
+def get_mtl_dataset(db_name, config, transforms, split='train'):
+    """Return an MTL dataset for the requested split."""
+    split_label = ''.join(split) if isinstance(split, (list, tuple)) else split
+    print('Preparing {} loader for db: {}'.format(split_label, db_name))
 
     if db_name == 'NYUD':
-        database = NYUD_MT(root=config.DATA.DATA_PATH, split='train', transform=transforms,
+        database = NYUD_MT(root=config.DATA.DATA_PATH, split=split, transform=transforms,
                            do_edge='edge' in config.TASKS,
                            do_semseg='semseg' in config.TASKS,
                            do_normals='normals' in config.TASKS,
                            do_depth='depth' in config.TASKS, overfit=False)
     elif db_name == 'PASCALContext':
-        database = PASCALContext(root=config.DATA.DATA_PATH, split=['train'], transform=transforms, retname=True,
+        pascal_split = split if isinstance(split, list) else [split]
+        database = PASCALContext(root=config.DATA.DATA_PATH, split=pascal_split, transform=transforms, retname=True,
                                  do_semseg='semseg' in config.TASKS,
                                  do_edge='edge' in config.TASKS,
                                  do_normals='normals' in config.TASKS,
@@ -722,6 +737,11 @@ def get_mtl_train_dataset(db_name, config, transforms):
             "train_db_name: Choose among PASCALContext and NYUD")
 
     return database
+
+
+def get_mtl_train_dataset(db_name, config, transforms):
+    """ Return the train dataset """
+    return get_mtl_dataset(db_name, config, transforms, split='train')
 
 
 def get_tasks_config(db_name, task_list, img_size):
@@ -868,43 +888,21 @@ def get_transformations(db_name, config):
     return transforms_tr, transforms_ts
 
 
-def get_mtl_train_dataloader(config, dataset):
+def get_mtl_train_dataloader(config, dataset, sampler=None):
     """ Return the train dataloader """
 
-    trainloader = DataLoader(dataset, batch_size=config.DATA.BATCH_SIZE, shuffle=True, drop_last=True,
+    trainloader = DataLoader(dataset, batch_size=config.DATA.BATCH_SIZE, shuffle=(sampler is None), sampler=sampler, drop_last=True,
                              num_workers=config.DATA.NUM_WORKERS, collate_fn=collate_mil, pin_memory=config.DATA.PIN_MEMORY)
     return trainloader
 
 
 def get_mtl_val_dataset(db_name, config, transforms):
     """ Return the validation dataset """
-
-    print('Preparing val loader for db: {}'.format(db_name))
-
-    if db_name == 'NYUD':
-        database = NYUD_MT(root=config.DATA.DATA_PATH, split='val', transform=transforms,
-                           do_edge='edge' in config.TASKS,
-                           do_semseg='semseg' in config.TASKS,
-                           do_normals='normals' in config.TASKS,
-                           do_depth='depth' in config.TASKS, overfit=False)
-    elif db_name == 'PASCALContext':
-        database = PASCALContext(root=config.DATA.DATA_PATH, split=['val'], transform=transforms, retname=True,
-                                 do_semseg='semseg' in config.TASKS,
-                                 do_edge='edge' in config.TASKS,
-                                 do_normals='normals' in config.TASKS,
-                                 do_sal='sal' in config.TASKS,
-                                 do_human_parts='human_parts' in config.TASKS,
-                                 overfit=False)
-
-    else:
-        raise NotImplemented(
-            "test_db_name: Choose among PASCALContext and NYUD")
-
-    return database
+    return get_mtl_dataset(db_name, config, transforms, split='val')
 
 
-def get_mtl_val_dataloader(config, dataset):
+def get_mtl_val_dataloader(config, dataset, sampler=None):
     """ Return the validation dataloader """
-    testloader = DataLoader(dataset, batch_size=config.DATA.BATCH_SIZE, shuffle=False, drop_last=False,
+    testloader = DataLoader(dataset, batch_size=config.DATA.BATCH_SIZE, shuffle=False, sampler=sampler, drop_last=False,
                             num_workers=config.DATA.NUM_WORKERS, pin_memory=config.DATA.PIN_MEMORY)
     return testloader
