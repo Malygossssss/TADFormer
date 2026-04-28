@@ -564,7 +564,17 @@ def validate(config, data_loader, model, epoch, infer=False):
         if infer:
             from utils import save_imgs_mtl, save_model_pred_for_one_task
             save_dirs = os.path.join(config.OUTPUT, "image")
-            save_imgs_mtl(images, targets, processed_output, save_dirs, batch['meta']['image'])
+            image_ids = batch['meta']['image']
+            if not isinstance(image_ids, (list, tuple)):
+                image_ids = [image_ids] * images.size(0)
+            for sample_idx, image_id in enumerate(image_ids):
+                save_imgs_mtl(
+                    images[sample_idx],
+                    {task: targets[task][sample_idx] for task in tasks},
+                    {task: processed_output[task][sample_idx] for task in tasks},
+                    save_dirs,
+                    image_id,
+                )
             # save_model_pred_for_one_task(batch, output, save_dirs, task=task)
 
         num_val_points += 1
