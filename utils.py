@@ -696,28 +696,37 @@ def save_model_pred_for_one_task(p, sample, output, save_dirs, task=None, epoch=
 
 
 
-def save_imgs_mtl(batch_imgs, batch_labels, path, id):
+def save_imgs_mtl(batch_imgs, batch_labels, batch_predictions=None, path=None, id=None):
 
-    # 수정할 부분 : 1) normalized gt, sal output,
-    import torchvision
+    # Save normalized inputs, ground truth labels, and optional predictions.
+    if id is None:
+        id = path
+        path = batch_predictions
+        batch_predictions = None
+
+    mkdir_if_missing(path)
+    id = id[0] if isinstance(id, (list, tuple)) and len(id) == 1 else id
+    id = str(id)
 
     imgs = tens2image(batch_imgs, transpose=True)
     labels = {task: tens2image(label, transpose=True)
               for task, label in batch_labels.items()}
-    #predictions = {task: tens2image(prediction)
-                   #for task, prediction in batch_predictions.items()}
+    predictions = {}
+    if batch_predictions is not None:
+        predictions = {task: tens2image(prediction)
+                       for task, prediction in batch_predictions.items()}
 
-    # Image.fromarray(normalize(imgs, 0, 255).astype(
-    #     np.uint8)).save(f'{path}/{id}_img.png')
+    Image.fromarray(normalize(imgs, 0, 255).astype(
+        np.uint8)).save(os.path.join(path, f'{id}_img.png'))
 
-    task='edge'
-
-    labels[task] = normalize(labels[task], 0, 255)
-    #predictions[task] = normalize(predictions[task], 0, 255)
-    Image.fromarray(labels[task].astype(np.uint8)).save(
-        f'{path}/{id}.png')
-    # Image.fromarray(predictions[task].astype(np.uint8)).save(
-    #     f'{path}/{id}_{task}_pred.png')
+    for task in labels.keys():
+        labels[task] = normalize(labels[task], 0, 255)
+        Image.fromarray(labels[task].astype(np.uint8)).save(
+            os.path.join(path, f'{id}_{task}_gt.png'))
+        if task in predictions:
+            predictions[task] = normalize(predictions[task], 0, 255)
+            Image.fromarray(predictions[task].astype(np.uint8)).save(
+                os.path.join(path, f'{id}_{task}_pred.png'))
 
 
     # for task in labels.keys():
