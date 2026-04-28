@@ -1,7 +1,7 @@
 BASE: ['TADFormer_r64_Swin-T.yaml']
 
 MODEL:
-  NAME: AG_TADFormer_stage1_r64_Swin-T
+  NAME: AG_TADFormer_stage1_r64_Swin-T_nyuv2
   AGMTLORA:
     ENABLED: True
     STAGE: 1
