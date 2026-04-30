@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument("--pretrained", type=str)
     parser.add_argument("--resume", type=str)
     parser.add_argument("--resume-backbone", type=str)
+    parser.add_argument("--accumulation-steps", type=int)
     parser.add_argument("--use-checkpoint", action="store_true")
     parser.add_argument("--disable_amp", action="store_true")
     parser.add_argument("--seed", type=int)

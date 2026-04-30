@@ -355,6 +355,22 @@ def resolve_log_interval(num_batches: int) -> int:
     return max(1, min(50, num_batches // 10 if num_batches >= 10 else 1))
 
 
+def resolve_accumulation_steps(config: CN) -> int:
+    return max(1, int(getattr(config.TRAIN, "ACCUMULATION_STEPS", 1)))
+
+
+def accumulation_group_size(batch_idx: int, num_batches: int, accumulation_steps: int) -> int:
+    if accumulation_steps <= 1:
+        return 1
+    group_start = ((batch_idx - 1) // accumulation_steps) * accumulation_steps + 1
+    group_end = min(group_start + accumulation_steps - 1, max(num_batches, batch_idx))
+    return max(1, group_end - group_start + 1)
+
+
+def should_step_accumulated_gradients(batch_idx: int, num_batches: int, accumulation_steps: int) -> bool:
+    return batch_idx % accumulation_steps == 0 or batch_idx == num_batches
+
+
 def maybe_log_progress(logger, label: str, batch_idx: int, num_batches: int, log_interval: int, extra: str = "") -> None:
     if batch_idx == 1 or batch_idx == num_batches or batch_idx % max(1, log_interval) == 0:
         suffix = f" | {extra}" if extra else ""
@@ -373,26 +389,31 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
     optimizer = build_optimizer(config, model)
     num_train_batches = safe_num_batches(data_loader_train)
     log_interval = resolve_log_interval(num_train_batches)
+    accumulation_steps = resolve_accumulation_steps(config)
     warmup_epochs = int(config.MODEL.AGMTLORA.AFFINITY_WARMUP_EPOCHS)
     affinity_score_epochs = int(config.MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS)
 
     logger.info(
-        "Stage-1 affinity start | tasks=%s | warmup_epochs=%d | affinity_score_epochs=%d | train_batches=%d",
+        "Stage-1 affinity start | tasks=%s | warmup_epochs=%d | affinity_score_epochs=%d | train_batches=%d | accumulation_steps=%d",
         list(config.TASKS),
         warmup_epochs,
         affinity_score_epochs,
         num_train_batches,
+        accumulation_steps,
     )
 
     for epoch_idx in range(warmup_epochs):
         model.train()
+        optimizer.zero_grad()
         for batch_idx, batch in enumerate(data_loader_train, start=1):
             samples, targets = move_batch_to_device(batch, config.TASKS, device)
-            optimizer.zero_grad()
             outputs = model(samples)
             loss, _ = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+            loss_for_backward = loss / accumulation_group_size(batch_idx, num_train_batches, accumulation_steps)
+            loss_for_backward.backward()
+            if should_step_accumulated_gradients(batch_idx, num_train_batches, accumulation_steps):
+                optimizer.step()
+                optimizer.zero_grad()
             maybe_log_progress(
                 logger,
                 f"Warmup epoch {epoch_idx + 1}/{warmup_epochs}",
@@ -429,9 +450,9 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
         model.train()
         epoch_directed_sum = torch.zeros((len(config.TASKS), len(config.TASKS)), dtype=torch.float32, device=device)
         epoch_batches = 0
+        optimizer.zero_grad()
         for batch_idx, batch in enumerate(data_loader_train, start=1):
             samples, targets = move_batch_to_device(batch, config.TASKS, device)
-            optimizer.zero_grad()
             outputs = model(samples)
 
             flat_gradients = {}
@@ -458,8 +479,11 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
 
             epoch_batches += 1
             loss, _ = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+            loss_for_backward = loss / accumulation_group_size(batch_idx, num_train_batches, accumulation_steps)
+            loss_for_backward.backward()
+            if should_step_accumulated_gradients(batch_idx, num_train_batches, accumulation_steps):
+                optimizer.step()
+                optimizer.zero_grad()
             maybe_log_progress(
                 logger,
                 f"Affinity epoch {affinity_epoch_idx + 1}/{affinity_score_epochs}",
