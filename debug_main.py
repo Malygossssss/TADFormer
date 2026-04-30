@@ -373,7 +373,11 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
         is_second_order = hasattr(
             optimizer, 'is_second_order') and optimizer.is_second_order
-        grad_norm = loss_scaler(loss, optimizer, clip_grad=config.TRAIN.CLIP_GRAD,
+        loss_for_backward = loss
+        if config.TRAIN.ACCUMULATION_STEPS > 1:
+            loss_for_backward = loss_for_backward / config.TRAIN.ACCUMULATION_STEPS
+
+        grad_norm = loss_scaler(loss_for_backward, optimizer, clip_grad=config.TRAIN.CLIP_GRAD,
                                 parameters=model.parameters(), create_graph=is_second_order,
                                 update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
         if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
